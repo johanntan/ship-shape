@@ -13,6 +13,7 @@ categories = ["gui"]
 translatable = true
 
 [dependencies]
+homeport = "0.1.0"
 minisign-verify = "0.2.5"
 patois = "0.2.2"
 pulldown-cmark = { version = "0.13.4", default-features = false }

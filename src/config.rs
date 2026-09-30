@@ -9,6 +9,14 @@ pub enum InstallKind {
 	Portable,
 }
 
+/// A portable copy updates from the archive. Everything else, including a macOS app bundle where
+/// the kind is ignored, updates from the installer or `AppImage`.
+impl From<homeport::InstallKind> for InstallKind {
+	fn from(kind: homeport::InstallKind) -> Self {
+		if kind.is_portable() { Self::Portable } else { Self::Installer }
+	}
+}
+
 /// Configuration for the updater. Construct once and pass to all ship-shape functions.
 #[derive(Debug, Clone)]
 pub struct UpdaterConfig {
