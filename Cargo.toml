@@ -28,3 +28,5 @@ all = { level = "warn", priority = -1 }
 cargo = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# ring and dirs pin different windows-sys versions, which a library has no say in.
+multiple_crate_versions = "allow"
