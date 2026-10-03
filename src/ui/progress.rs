@@ -68,7 +68,7 @@ impl<D> Drop for ProgressUpdate<'_, D> {
 }
 
 /// Keep the gauge below its native completion value until preparation and verification finish.
-/// Update(100) without AutoHide opens a nested modal loop and waits for the user to close it.
+/// `Update(100)` without `AutoHide` opens a nested modal loop and waits for the user to close it.
 pub(super) fn download_percent(downloaded: u64, total: u64) -> Option<i32> {
 	downloaded.saturating_mul(100).checked_div(total).map(|value| i32::try_from(value.min(99)).unwrap_or(99))
 }

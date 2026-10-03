@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 /// How the running copy of the app was installed. Selects which release asset to download and how
 /// to apply it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,7 +61,7 @@ pub struct UpdaterConfig {
 	/// Environment overrides passed to macOS `open` when relaunching the app. Empty by default.
 	/// Use this for an explicit configuration directory that must survive a Launch Services launch.
 	/// Ignored on other platforms. Values are passed as arguments, never as shell source.
-	pub macos_relaunch_env: Vec<(String, String)>,
+	pub macos_relaunch_env: Vec<(String, OsString)>,
 }
 
 impl UpdaterConfig {
@@ -140,7 +142,7 @@ impl UpdaterConfig {
 
 	/// Preserve an environment override when macOS relaunches the updated app.
 	#[must_use]
-	pub fn with_macos_relaunch_env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+	pub fn with_macos_relaunch_env(mut self, name: impl Into<String>, value: impl Into<OsString>) -> Self {
 		self.macos_relaunch_env.push((name.into(), value.into()));
 		self
 	}

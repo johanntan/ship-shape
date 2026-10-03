@@ -8,6 +8,7 @@ repository = "https://github.com/trypsynth/ship-shape"
 readme = "README.md"
 keywords = ["updater", "wxdragon", "auto-update", "desktop", "github-releases"]
 categories = ["gui"]
+exclude = ["examples/"]
 
 [package.metadata.patois]
 translatable = true

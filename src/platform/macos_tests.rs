@@ -5,12 +5,15 @@ use std::{
 	path::PathBuf,
 	process::{Child, Command},
 	thread,
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime},
 };
 
 use tempfile::TempDir;
 
-use super::{PreparedUpdate, bundle_stamp, check_cancelled, find_replacement, validate_bundle};
+use super::{
+	PreparedUpdate, STALE_STAGE_AGE, bundle_stamp, check_cancelled, find_replacement, register_stage, signing_team,
+	sweep_stale_stages, validate_bundle, validate_bundle_integrity,
+};
 
 struct Fixture {
 	root: TempDir,
@@ -29,6 +32,7 @@ impl Fixture {
 		fs::create_dir(stage.join("new.app")).unwrap();
 		fs::write(bundle.join("version"), "old").unwrap();
 		fs::write(stage.join("new.app/version"), "new").unwrap();
+		fs::write(root.path().join("log"), "diagnostic").unwrap();
 		Self { root, bundle, stage }
 	}
 
@@ -121,6 +125,7 @@ fn helper_replaces_and_cleans_up_with_quoted_paths() {
 	assert!(wait(fixture.launch(u32::MAX, true, "")));
 	assert_eq!(fixture.version(), "new");
 	assert!(!fixture.stage.exists());
+	assert!(!fixture.root.path().join("log").exists());
 	let args = fs::read_to_string(fixture.root.path().join("launch-args")).unwrap();
 	assert!(args.ends_with("--env\nTEST_CONFIG_PATH=O'Brien test/settings\n"));
 }
@@ -131,6 +136,7 @@ fn helper_restores_old_bundle_after_install_failure() {
 	assert!(!wait(fixture.launch(u32::MAX, true, "rename")));
 	assert_eq!(fixture.version(), "old");
 	assert!(!fixture.stage.exists());
+	assert!(fixture.root.path().join("log").exists());
 }
 
 #[test]
@@ -147,6 +153,7 @@ fn helper_preserves_backup_when_launch_fails() {
 	assert!(!wait(fixture.launch(u32::MAX, true, "launch")));
 	assert_eq!(fixture.version(), "new");
 	assert_eq!(fs::read_to_string(fixture.stage.join("old.app/version")).unwrap(), "old");
+	assert!(fixture.root.path().join("log").exists());
 }
 
 #[test]
@@ -178,6 +185,7 @@ fn dropping_prepared_update_cancels_before_replacement() {
 	fs::remove_dir_all(&fixture.stage).unwrap();
 	assert!(wait(child));
 	assert_eq!(fixture.version(), "old");
+	assert!(!fixture.root.path().join("log").exists());
 	let stage = tempfile::tempdir().unwrap();
 	let path = stage.path().to_owned();
 	drop(PreparedUpdate { stage });
@@ -208,14 +216,14 @@ fn rejects_missing_escaping_and_unsigned_executables() {
 	use std::os::unix::fs::PermissionsExt;
 	let root = tempfile::tempdir().unwrap();
 	let bundle = metadata_bundle(root.path(), "Missing.app", "id", "app");
-	assert!(validate_bundle(&bundle).is_err());
+	assert!(validate_bundle(&bundle, "TESTTEAM01").is_err());
 	let bundle = metadata_bundle(root.path(), "Escaping.app", "id", "../../outside");
-	assert!(validate_bundle(&bundle).is_err());
+	assert!(validate_bundle(&bundle, "TESTTEAM01").is_err());
 	let bundle = metadata_bundle(root.path(), "Unsigned.app", "id", "app");
 	let executable = bundle.join("Contents/MacOS/app");
 	fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
 	fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-	assert!(validate_bundle(&bundle).is_err());
+	assert!(validate_bundle(&bundle, "TESTTEAM01").is_err());
 }
 
 #[test]
@@ -247,8 +255,71 @@ fn signed_bundle_passes_but_tampering_fails() {
 	fs::copy("/usr/bin/true", bundle.join("Contents/MacOS/app")).unwrap();
 	let status = Command::new("/usr/bin/codesign").args(["--force", "--sign", "-"]).arg(&bundle).output().unwrap();
 	assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
-	validate_bundle(&bundle).unwrap();
+	validate_bundle_integrity(&bundle).unwrap();
+	assert!(signing_team(&bundle).is_none());
+	let error = validate_bundle(&bundle, "TESTTEAM01").unwrap_err();
+	assert!(error.contains("developer team"), "{error}");
 	fs::write(&resource, "tampered").unwrap();
-	let error = validate_bundle(&bundle).unwrap_err();
+	let error = validate_bundle_integrity(&bundle).unwrap_err();
 	assert!(error.contains("signature verification failed"), "{error}");
+}
+
+#[test]
+fn unsigned_host_has_no_signing_team() {
+	let root = tempfile::tempdir().unwrap();
+	let bundle = metadata_bundle(root.path(), "Unsigned.app", "id", "app");
+	fs::copy("/usr/bin/true", bundle.join("Contents/MacOS/app")).unwrap();
+	assert!(signing_team(&bundle).is_none());
+}
+
+#[test]
+#[ignore = "requires SHIP_SHAPE_TEST_SIGNED_APP pointing to an Apple Developer-signed app"]
+fn developer_signed_release_accepts_only_its_team() {
+	let bundle = PathBuf::from(std::env::var_os("SHIP_SHAPE_TEST_SIGNED_APP").expect("provide a signed app path"));
+	let team = signing_team(&bundle).expect("the fixture must have an Apple developer team");
+	validate_bundle(&bundle, &team).unwrap();
+	let other = if team == "TESTTEAM01" { "TESTTEAM02" } else { "TESTTEAM01" };
+	let error = validate_bundle(&bundle, other).unwrap_err();
+	assert!(error.contains("developer team"), "{error}");
+}
+
+#[test]
+fn stale_stage_cleanup_preserves_live_helpers_backups_and_other_apps() {
+	use std::os::unix::fs::MetadataExt;
+	let root = tempfile::tempdir().unwrap();
+	let bundle = metadata_bundle(root.path(), "Current.app", "id", "app");
+	let other = metadata_bundle(root.path(), "Other.app", "other.id", "app");
+	let make_stage = |name: &str, app: &std::path::Path| {
+		let stage = root.path().join(format!(".ship-shape-{name}"));
+		fs::create_dir(&stage).unwrap();
+		register_stage(&stage, app).unwrap();
+		fs::write(stage.join("host-pid"), "999999999").unwrap();
+		fs::create_dir(stage.join("new.app")).unwrap();
+		stage
+	};
+	let abandoned = make_stage("abandoned", &bundle);
+	let live_host = make_stage("host", &bundle);
+	fs::write(live_host.join("host-pid"), std::process::id().to_string()).unwrap();
+	let live_helper = make_stage("helper", &bundle);
+	fs::write(live_helper.join("helper-pid"), std::process::id().to_string()).unwrap();
+	let recovery = make_stage("recovery", &bundle);
+	fs::create_dir(recovery.join("old.app")).unwrap();
+	let unrelated = make_stage("other", &other);
+	let malformed = make_stage("malformed", &bundle);
+	fs::write(malformed.join("host-pid"), "-1").unwrap();
+	let unregistered = root.path().join(".ship-shape-unregistered");
+	fs::create_dir(&unregistered).unwrap();
+	let symlink = root.path().join(".ship-shape-link");
+	std::os::unix::fs::symlink(&abandoned, &symlink).unwrap();
+	let owner = abandoned.metadata().unwrap().uid();
+	sweep_stale_stages(root.path(), &bundle, owner, SystemTime::now());
+	assert!(abandoned.exists(), "recent stages must not be swept");
+	sweep_stale_stages(root.path(), &bundle, owner.wrapping_add(1), SystemTime::now() + STALE_STAGE_AGE * 2);
+	assert!(abandoned.exists(), "stages owned by another user must not be swept");
+	sweep_stale_stages(root.path(), &bundle, owner, SystemTime::now() + STALE_STAGE_AGE * 2);
+	assert!(!abandoned.exists());
+	for stage in [live_host, live_helper, recovery, unrelated, malformed, unregistered] {
+		assert!(stage.exists(), "must preserve {}", stage.display());
+	}
+	assert!(fs::symlink_metadata(symlink).unwrap().file_type().is_symlink());
 }

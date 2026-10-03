@@ -27,11 +27,15 @@ APPLESCRIPT
 cleanup() {
 	/bin/rm -rf "$stage"
 }
+printf '%s\n' "$$" > "$stage/helper-pid" || exit 1
 : > "$stage/ready" || exit 1
 # Cancelled UI flows drop the staging directory. Never touch the app without commit.
 count=0
 while [ ! -f "$stage/commit" ]; do
-	[ -d "$stage" ] || exit 0
+	if [ ! -d "$stage" ]; then
+		/bin/rm -f "$log"
+		exit 0
+	fi
 	count=$((count + 1))
 	if [ "$count" -ge 300 ]; then
 		printf '%s\n' 'Installation was not committed; keeping the current app.'
@@ -84,3 +88,4 @@ if ! launch_app "$@"; then
 fi
 printf '%s\n' 'Replacement completed and macOS accepted the launch request.'
 cleanup
+/bin/rm -f "$log"

@@ -251,7 +251,7 @@ fn start_download(
 						install_update(parent, download, on_exit);
 					}
 					drop(check);
-				}))
+				}));
 			});
 		}));
 		wxdragon::wake_up_idle();

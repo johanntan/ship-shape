@@ -1,10 +1,13 @@
 use std::{
-	env, fs,
+	env,
+	ffi::OsString,
+	fs,
+	os::unix::fs::MetadataExt,
 	path::{Path, PathBuf},
 	process::{self, Command, Stdio},
 	sync::atomic::{AtomicBool, Ordering},
 	thread,
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime},
 };
 
 use patois::t;
@@ -12,6 +15,8 @@ use tempfile::TempDir;
 
 use super::InstallOutcome;
 use crate::{InstallKind, UpdateError, UpdaterConfig};
+
+const STALE_STAGE_AGE: Duration = Duration::from_hours(24);
 
 /// macOS has a single asset kind, a disk image, so `install_kind` is ignored.
 pub const fn asset_name_parts(_install_kind: InstallKind) -> (&'static str, &'static str) {
@@ -62,25 +67,31 @@ pub fn install_with_cancel(
 	let Some(parent) = bundle.parent() else {
 		return manual_install(config, path);
 	};
+	let Some(team) = signing_team(&bundle) else {
+		return manual_install(config, path);
+	};
+	validate_bundle(&bundle, &team)?;
 	let Ok(stage) = tempfile::Builder::new().prefix(".ship-shape-").tempdir_in(parent) else {
 		return manual_install(config, path);
 	};
+	register_stage(stage.path(), &bundle)?;
+	sweep_stale_stages(parent, &bundle, stage.path().metadata().map_err(|e| e.to_string())?.uid(), SystemTime::now());
 	let original_stamp = bundle_stamp(&bundle)?;
 	let identity = plist_value(&bundle, "CFBundleIdentifier")?;
 	let mount = Mount::attach(path)?;
 	check_cancelled(cancelled)?;
 	let replacement = find_replacement(&mount.point, &identity)?;
-	validate_bundle(&replacement)?;
+	validate_bundle(&replacement, &team)?;
 	let staged = stage.path().join("new.app");
 	run(Command::new("/usr/bin/ditto").arg(&replacement).arg(&staged), &t("Failed to stage the application"))?;
 	check_cancelled(cancelled)?;
-	validate_bundle(&staged)?;
+	validate_bundle(&staged, &team)?;
 	if plist_value(&staged, "CFBundleIdentifier")? != identity {
 		return Err(t("The update contains a different application."));
 	}
 	mount.detach()?;
 	check_cancelled(cancelled)?;
-	// Keep the diagnostic outside the staging directory so it survives cleanup and relaunch.
+	// Failure diagnostics survive cleanup. The helper removes the log after a successful launch.
 	let logs = env::var_os("HOME")
 		.map(|home| PathBuf::from(home).join("Library/Logs"))
 		.ok_or_else(|| t("Could not determine the update log directory."))?;
@@ -106,7 +117,10 @@ pub fn install_with_cancel(
 		.stdout(Stdio::from(log_file.try_clone().map_err(|e| e.to_string())?))
 		.stderr(Stdio::from(log_file));
 	for (name, value) in &config.macos_relaunch_env {
-		command.arg("--env").arg(format!("{name}={value}"));
+		let mut assignment = OsString::from(name);
+		assignment.push("=");
+		assignment.push(value);
+		command.arg("--env").arg(assignment);
 	}
 	let mut helper = command.spawn().map_err(|e| format!("{}: {e}", t("Failed to launch update helper")))?;
 	let deadline = Instant::now() + Duration::from_secs(5);
@@ -151,7 +165,6 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
 }
 
 fn bundle_stamp(bundle: &Path) -> Result<String, String> {
-	use std::os::unix::fs::MetadataExt;
 	let metadata = fs::symlink_metadata(bundle).map_err(|e| e.to_string())?;
 	Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
 }
@@ -208,7 +221,34 @@ fn find_replacement(root: &Path, identity: &str) -> Result<PathBuf, String> {
 	Ok(matches.remove(0))
 }
 
-fn validate_bundle(bundle: &Path) -> Result<(), String> {
+fn signing_team(bundle: &Path) -> Option<String> {
+	let output = Command::new("/usr/bin/codesign").args(["--display", "--verbose=4"]).arg(bundle).output().ok()?;
+	if !output.status.success() {
+		return None;
+	}
+	let metadata = String::from_utf8(output.stderr).ok()?;
+	let team = metadata.lines().find_map(|line| line.strip_prefix("TeamIdentifier="))?;
+	// Apple Team IDs contain ten ASCII letters/digits. This also rejects "not set" and
+	// keeps the value safe to embed in the native code requirement language.
+	(team.len() == 10 && team.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()))
+		.then(|| team.to_owned())
+}
+
+fn validate_bundle(bundle: &Path, team: &str) -> Result<(), String> {
+	validate_bundle_integrity(bundle)?;
+	// Checking TeamIdentifier metadata alone could trust a self-signed certificate. Require
+	// an Apple-issued signing chain and the running app's team in the certificate itself.
+	let requirement = format!("anchor apple generic and certificate leaf[subject.OU] = \"{team}\"");
+	run(
+		Command::new("/usr/bin/codesign")
+			.args(["--verify", "--deep", "--strict"])
+			.arg(format!("-R={requirement}"))
+			.arg(bundle),
+		&t("The update must be signed by the application's developer team"),
+	)
+}
+
+fn validate_bundle_integrity(bundle: &Path) -> Result<(), String> {
 	let name = plist_value(bundle, "CFBundleExecutable")?;
 	if Path::new(&name).file_name().is_none_or(|n| n != name.as_str()) {
 		return Err(t("Invalid application executable."));
@@ -223,6 +263,69 @@ fn validate_bundle(bundle: &Path) -> Result<(), String> {
 		Command::new("/usr/bin/codesign").args(["--verify", "--deep", "--strict"]).arg(bundle),
 		&t("Application signature verification failed"),
 	)
+}
+
+fn register_stage(stage: &Path, bundle: &Path) -> Result<(), String> {
+	let bundle = bundle.canonicalize().map_err(|e| e.to_string())?;
+	fs::write(stage.join("owner-bundle"), bundle.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+	fs::write(stage.join("host-pid"), process::id().to_string()).map_err(|e| e.to_string())
+}
+
+/// Only remove abandoned stages belonging to this app and user. Recovery backups are kept.
+fn sweep_stale_stages(parent: &Path, bundle: &Path, owner: u32, now: SystemTime) {
+	let Ok(bundle) = bundle.canonicalize() else { return };
+	let Ok(entries) = fs::read_dir(parent) else { return };
+	for entry in entries.flatten() {
+		if !entry.file_name().to_string_lossy().starts_with(".ship-shape-") {
+			continue;
+		}
+		let stage = entry.path();
+		let Ok(metadata) = fs::symlink_metadata(&stage) else { continue };
+		if !metadata.is_dir() || metadata.uid() != owner {
+			continue;
+		}
+		match fs::symlink_metadata(stage.join("old.app")) {
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			_ => continue,
+		}
+		let marker = stage.join("owner-bundle");
+		let Ok(metadata) = fs::symlink_metadata(&marker) else { continue };
+		if !metadata.is_file() || metadata.uid() != owner {
+			continue;
+		}
+		let old_enough = metadata
+			.modified()
+			.ok()
+			.and_then(|time| now.duration_since(time).ok())
+			.is_some_and(|age| age >= STALE_STAGE_AGE);
+		if !old_enough || !fs::read(&marker).is_ok_and(|path| path == bundle.as_os_str().as_encoded_bytes()) {
+			continue;
+		}
+		if stage_process_alive(&stage.join("host-pid"), owner, false)
+			|| stage_process_alive(&stage.join("helper-pid"), owner, true)
+		{
+			continue;
+		}
+		let _ = fs::remove_dir_all(stage);
+	}
+}
+
+fn stage_process_alive(path: &Path, owner: u32, optional: bool) -> bool {
+	let metadata = match fs::symlink_metadata(path) {
+		Ok(metadata) => metadata,
+		Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return false,
+		Err(_) => return true,
+	};
+	if !metadata.is_file() || metadata.uid() != owner {
+		return true;
+	}
+	let Some(pid) =
+		fs::read_to_string(path).ok().and_then(|text| text.trim().parse::<i32>().ok()).filter(|pid| *pid > 0)
+	else {
+		return true;
+	};
+	// Fail closed if process inspection itself cannot run. A reused PID only delays cleanup.
+	Command::new("/bin/kill").args(["-0", &pid.to_string()]).output().map_or(true, |output| output.status.success())
 }
 
 fn run(command: &mut Command, message: &str) -> Result<(), String> {

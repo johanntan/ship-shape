@@ -67,15 +67,17 @@ ui::run_update_check(config, &frame, UpdateChannel::Stable, CheckTrigger::Manual
 
 Updates replace the running app at its existing location, including custom folders and renamed
 bundles. The DMG must contain exactly one top-level `.app` matching the running bundle identifier,
-with a valid code signature and executable. Mounted images and Gatekeeper-translocated apps are
-not modified. No administrator privileges are requested.
+with a valid code signature and executable. Both the running app and its replacement must carry
+the same Apple developer Team ID, verified against an Apple-issued signing chain. Unsigned and
+ad-hoc signed development builds use the manual flow. Mounted images and Gatekeeper-translocated
+apps are not modified. No administrator privileges are requested.
 
 Mounting, validation, copying, and the helper handshake run off the UI thread. Canceling before
 shutdown drops the staged update. The detached helper waits up to 60 seconds for the app to exit,
 then swaps bundles using same-filesystem renames. A failed replacement restores the old bundle;
-a failed restore or launch preserves the backup and reports its location. Helper logs survive
-cleanup under `~/Library/Logs/ship-shape-update-*.log`. A successful Launch Services request does
-not detect subsequent application crashes.
+a failed restore or launch preserves the backup and reports its location. Failure logs survive
+cleanup under `~/Library/Logs/ship-shape-update-*.log`; successful and canceled updates remove
+their logs. A successful Launch Services request does not detect subsequent application crashes.
 
 Use `ui::run_update_check_with_exit_handler` to save state and terminate normally. The existing
 `run_update_check` entry point keeps its immediate process-exit behavior. The handler runs on the
@@ -86,11 +88,14 @@ UI thread only after successful installer preparation. It must terminate the pro
 when launching through macOS `open`, such as an isolated settings directory. It is ignored on
 other platforms; values are passed as arguments and never interpolated into shell code.
 
-For local testing, build `cargo build --example macos_update_demo`. Run the example with
+From a repository checkout, build `cargo build --example macos_update_demo`. Run the example with
 `--setup /tmp/ship-shape-demo` using a new directory, then run the generated
 `Installed Demo.app/Contents/MacOS/demo` executable with `--cancel` or `--apply` followed by the
-fixture's `demo.dmg` path. Applying must display version 2; canceling must retain version 1.
-The demo trusts its own local, ad-hoc signed fixture; it does not change production verification.
+fixture's `demo.dmg` path. For automatic installation, set `SHIP_SHAPE_DEMO_SIGNING_ID` to an
+Apple-issued signing identity when running `--setup`. Applying must display version 2; canceling must retain version 1. Without
+that identity, fixtures are ad-hoc signed and demonstrate the manual fallback instead. The demo
+trusts only its generated local fixture and keeps the production signer checks. It is a repository
+test harness, excluded from the published crate package.
 
 The download gauge stays below 100 until verification and preparation finish. Native progress
 updates can yield to the event loop, so completion waits for the active Update/Pulse call to
@@ -102,6 +107,13 @@ failed restore and launch, competing destination changes, protected locations, b
 signature tampering, and paths with spaces and apostrophes. Tests substitute launch commands and
 alerts and only modify temporary fixture apps. The demo above additionally exercises actual DMG
 mounting and Launch Services; testing a signed, notarized release establishes the Gatekeeper path.
+For a read-only signer check with an existing release, set `SHIP_SHAPE_TEST_SIGNED_APP` to its
+app path and run `cargo test developer_signed_release_accepts_only_its_team -- --ignored`.
+
+On the next automatic update, stages older than 24 hours are swept only when they belong to the
+same bundle and user and neither the host nor helper process is alive. Unregistered stages,
+symlinks, and stages containing `old.app` recovery backups are preserved. This avoids deleting
+another app's staging area, an active update, or the only recoverable copy after a failed swap.
 
 ## License
 

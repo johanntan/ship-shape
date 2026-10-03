@@ -1,6 +1,7 @@
 //! Disposable macOS updater demo. It includes the actual installer implementation, without
 //! adding a production API for applying arbitrary local files. No network or key bypass is
 //! added to the updater. This demo trusts ONLY its own locally generated fixture image.
+//! Set `SHIP_SHAPE_DEMO_SIGNING_ID` to an Apple-issued signing identity for automatic installation.
 #![allow(dead_code, reason = "the shared platform module has APIs unused by the demo")]
 
 #[cfg(target_os = "macos")]
@@ -115,8 +116,9 @@ fn make_bundle(bundle: &Path, version: &str) -> Result<(), Box<dyn std::error::E
 </dict></plist>"#
 		),
 	)?;
-	if !Command::new("/usr/bin/codesign").args(["--force", "--sign", "-"]).arg(bundle).status()?.success() {
-		return Err("Failed to ad-hoc sign fixture".into());
+	let identity = env::var("SHIP_SHAPE_DEMO_SIGNING_ID").unwrap_or_else(|_| "-".to_owned());
+	if !Command::new("/usr/bin/codesign").args(["--force", "--sign", &identity]).arg(bundle).status()?.success() {
+		return Err("Failed to sign fixture".into());
 	}
 	Ok(())
 }
